@@ -2,7 +2,7 @@ name: Yandex Market Notify
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '13 * * * *'
   workflow_dispatch: {}
 
 permissions:
