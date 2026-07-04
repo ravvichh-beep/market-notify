@@ -1,6 +1,7 @@
 // Yandex Market -> Telegram notifier
-// Polls recent orders + product feedback, diffs against local state, notifies on anything new.
-// Config comes from process.env (GitHub Actions secrets) with a local .env fallback for manual runs.
+// Polls orders, feedback, chats, returns and stock levels, diffs against local state,
+// notifies on anything new. Config comes from process.env (GitHub Actions secrets)
+// with a local .env fallback for manual runs.
 
 const fs = require('fs');
 const path = require('path');
@@ -8,6 +9,9 @@ const path = require('path');
 const DIR = __dirname;
 const ENV_PATH = path.join(DIR, '.env');
 const STATE_PATH = path.join(DIR, 'state.json');
+
+const LOW_STOCK_THRESHOLD = 3;
+const UNANSWERED_REVIEW_HOURS = 24;
 
 function loadEnv() {
   const required = [
@@ -33,10 +37,16 @@ function loadEnv() {
 }
 
 function loadState() {
-  if (!fs.existsSync(STATE_PATH)) {
-    return { orders: {}, feedbacks: {}, firstRun: true };
-  }
-  return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+  const defaults = {
+    orders: {},
+    feedbacks: {},
+    chats: {},
+    returns: {},
+    lowStock: {},
+    firstRun: true,
+  };
+  if (!fs.existsSync(STATE_PATH)) return defaults;
+  return { ...defaults, ...JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')) };
 }
 
 function saveState(state) {
@@ -85,6 +95,13 @@ const STATUS_RU = {
   RESERVED: 'Зарезервирован',
 };
 
+const RETURN_STATUS_RU = {
+  READY_FOR_PICKUP: 'Готов к отгрузке',
+  IN_TRANSIT: 'В пути',
+  DELIVERED: 'Доставлен на склад',
+  FINISHED: 'Обработан',
+};
+
 async function checkOrders(env, state, notifications) {
   const data = await yandexGet(`/campaigns/${env.YANDEX_CAMPAIGN_ID}/orders?limit=50`, env.YANDEX_API_KEY);
   const orders = data.orders || [];
@@ -118,9 +135,13 @@ async function checkFeedback(env, state, notifications) {
     limit: 50,
   });
   const feedbacks = (data.result && data.result.feedbacks) || [];
+  const now = Date.now();
+
   for (const f of feedbacks) {
     const id = String(f.feedbackId);
-    if (state.feedbacks[id] === undefined) {
+    let entry = state.feedbacks[id];
+
+    if (entry === undefined) {
       if (!state.firstRun) {
         const rating = f.rating != null ? `${f.rating}★` : '';
         const comment = (f.description && f.description.comment) || '';
@@ -131,8 +152,129 @@ async function checkFeedback(env, state, notifications) {
           `${shortComment}`
         );
       }
+      entry = { seen: true, reminded: false };
     }
-    state.feedbacks[id] = true;
+
+    // Backward-compat: older state entries stored `true` instead of an object.
+    if (entry === true) entry = { seen: true, reminded: false };
+
+    const ageHours = (now - new Date(f.createdAt).getTime()) / 3600000;
+    if (f.needReaction && !entry.reminded && ageHours >= UNANSWERED_REVIEW_HOURS) {
+      if (!state.firstRun) {
+        notifications.push(
+          `⏰ Отзыв без ответа больше ${UNANSWERED_REVIEW_HOURS}ч\n` +
+          `${f.author || 'Аноним'} (${f.rating != null ? f.rating + '★' : ''})\n` +
+          `Ответь, чтобы не терять индекс качества.`
+        );
+      }
+      entry.reminded = true;
+    }
+    if (!f.needReaction) entry.reminded = false;
+
+    state.feedbacks[id] = entry;
+  }
+}
+
+const CHAT_NEEDS_REPLY = new Set(['NEW', 'WAITING_FOR_PARTNER']);
+
+async function checkChats(env, state, notifications) {
+  const data = await yandexPost(`/businesses/${env.YANDEX_BUSINESS_ID}/chats?limit=20`, env.YANDEX_API_KEY, {});
+  const chats = (data.result && data.result.chats) || [];
+
+  for (const c of chats) {
+    const id = String(c.chatId);
+    const prevStatus = state.chats[id];
+    const needsReply = CHAT_NEEDS_REPLY.has(c.status);
+
+    if (needsReply && prevStatus !== c.status) {
+      if (!state.firstRun) {
+        let lastMessage = '';
+        try {
+          const history = await yandexPost(
+            `/businesses/${env.YANDEX_BUSINESS_ID}/chats/history?chatId=${c.chatId}&limit=1`,
+            env.YANDEX_API_KEY,
+            {}
+          );
+          const msgs = (history.result && history.result.messages) || [];
+          lastMessage = msgs.length ? msgs[msgs.length - 1].message : '';
+        } catch (e) {
+          log(`Chat history fetch failed for ${id}: ${e.message}`);
+        }
+        const shortMsg = lastMessage.length > 300 ? lastMessage.slice(0, 300) + '…' : lastMessage;
+        notifications.push(
+          `💬 Новое сообщение в чате (заказ #${c.orderId || '—'})\n` +
+          `${c.context && c.context.customer && c.context.customer.name || 'Покупатель'}\n` +
+          `${shortMsg}`
+        );
+      }
+    }
+    state.chats[id] = c.status;
+  }
+}
+
+async function checkReturns(env, state, notifications) {
+  const data = await yandexGet(`/campaigns/${env.YANDEX_CAMPAIGN_ID}/returns?limit=50`, env.YANDEX_API_KEY);
+  const returns = (data.result && data.result.returns) || [];
+
+  for (const r of returns) {
+    const id = String(r.id);
+    const prevStatus = state.returns[id];
+    if (prevStatus === undefined) {
+      if (!state.firstRun) {
+        const typeLabel = r.returnType === 'UNREDEEMED' ? 'Невыкуп' : 'Возврат';
+        notifications.push(
+          `↩️ ${typeLabel} по заказу #${r.orderId}\n` +
+          `Статус: ${RETURN_STATUS_RU[r.shipmentStatus] || r.shipmentStatus}\n` +
+          `Сумма: ${r.amount ? r.amount.value + '₽' : '—'}`
+        );
+      }
+    } else if (prevStatus !== r.shipmentStatus) {
+      if (!state.firstRun) {
+        notifications.push(
+          `↩️ Возврат по заказу #${r.orderId}: статус изменился\n` +
+          `${RETURN_STATUS_RU[prevStatus] || prevStatus} → ${RETURN_STATUS_RU[r.shipmentStatus] || r.shipmentStatus}`
+        );
+      }
+    }
+    state.returns[id] = r.shipmentStatus;
+  }
+}
+
+async function checkStock(env, state, notifications) {
+  const [stockData, mappingData] = await Promise.all([
+    yandexPost(`/campaigns/${env.YANDEX_CAMPAIGN_ID}/offers/stocks`, env.YANDEX_API_KEY, {}),
+    yandexPost(`/businesses/${env.YANDEX_BUSINESS_ID}/offer-mappings?limit=200`, env.YANDEX_API_KEY, {}),
+  ]);
+
+  const names = {};
+  for (const m of (mappingData.result && mappingData.result.offerMappings) || []) {
+    names[m.offer.offerId] = m.offer.name;
+  }
+
+  const warehouses = (stockData.result && stockData.result.warehouses) || [];
+  const availableByOffer = {};
+  for (const w of warehouses) {
+    for (const o of w.offers || []) {
+      const available = (o.stocks || []).find(s => s.type === 'AVAILABLE');
+      const count = available ? available.count : 0;
+      availableByOffer[o.offerId] = (availableByOffer[o.offerId] || 0) + count;
+    }
+  }
+
+  for (const [offerId, count] of Object.entries(availableByOffer)) {
+    const wasLow = !!state.lowStock[offerId];
+    const isLow = count <= LOW_STOCK_THRESHOLD;
+    if (isLow && !wasLow) {
+      if (!state.firstRun) {
+        const name = names[offerId] || offerId;
+        notifications.push(
+          `📉 Заканчивается товар\n` +
+          `${name}\n` +
+          `Остаток: ${count} шт.`
+        );
+      }
+    }
+    state.lowStock[offerId] = isLow;
   }
 }
 
@@ -141,16 +283,20 @@ async function main() {
   const state = loadState();
   const notifications = [];
 
-  try {
-    await checkOrders(env, state, notifications);
-  } catch (e) {
-    log(`Orders check failed: ${e.message}`);
-  }
+  const checks = [
+    ['Orders', checkOrders],
+    ['Feedback', checkFeedback],
+    ['Chats', checkChats],
+    ['Returns', checkReturns],
+    ['Stock', checkStock],
+  ];
 
-  try {
-    await checkFeedback(env, state, notifications);
-  } catch (e) {
-    log(`Feedback check failed: ${e.message}`);
+  for (const [name, fn] of checks) {
+    try {
+      await fn(env, state, notifications);
+    } catch (e) {
+      log(`${name} check failed: ${e.message}`);
+    }
   }
 
   if (state.firstRun) {
