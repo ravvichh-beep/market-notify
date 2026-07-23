@@ -15,7 +15,10 @@ const STATE_PATH = path.join(DIR, 'state.json');
 // The key lives in the STATE_SECRET repo secret; without it the file is unreadable.
 function stateKey() {
   const hex = process.env.STATE_SECRET || readEnvValue('STATE_SECRET');
-  return hex ? Buffer.from(hex, 'hex') : null;
+  // Mandatory: the repo is public, so state must always be encrypted.
+  // No key means we refuse to run rather than risk writing plaintext.
+  if (!hex) throw new Error('STATE_SECRET not set — refusing to run to avoid writing plaintext state to a public repo');
+  return Buffer.from(hex, 'hex');
 }
 
 function readEnvValue(name) {
@@ -82,14 +85,12 @@ function loadState() {
   if (!fs.existsSync(STATE_PATH)) return defaults;
   const raw = fs.readFileSync(STATE_PATH, 'utf8').trim();
   if (!raw) return defaults;
-  const key = stateKey();
-  const parsed = key ? decryptState(raw, key) : JSON.parse(raw);
+  const parsed = decryptState(raw, stateKey());
   return { ...defaults, ...parsed };
 }
 
 function saveState(state) {
-  const key = stateKey();
-  fs.writeFileSync(STATE_PATH, key ? encryptState(state, key) : JSON.stringify(state, null, 2));
+  fs.writeFileSync(STATE_PATH, encryptState(state, stateKey()));
 }
 
 function log(msg) {

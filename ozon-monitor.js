@@ -27,7 +27,8 @@ function readEnvValue(name) {
 
 function stateKey() {
   const hex = process.env.STATE_SECRET || readEnvValue('STATE_SECRET');
-  return hex ? Buffer.from(hex, 'hex') : null;
+  if (!hex) throw new Error('STATE_SECRET not set — refusing to run to avoid writing plaintext state to a public repo');
+  return Buffer.from(hex, 'hex');
 }
 
 function encryptState(obj, key) {
@@ -71,14 +72,12 @@ function loadState() {
   if (!fs.existsSync(STATE_PATH)) return defaults;
   const raw = fs.readFileSync(STATE_PATH, 'utf8').trim();
   if (!raw) return defaults;
-  const key = stateKey();
-  const parsed = key ? decryptState(raw, key) : JSON.parse(raw);
+  const parsed = decryptState(raw, stateKey());
   return { ...defaults, ...parsed };
 }
 
 function saveState(state) {
-  const key = stateKey();
-  fs.writeFileSync(STATE_PATH, key ? encryptState(state, key) : JSON.stringify(state, null, 2));
+  fs.writeFileSync(STATE_PATH, encryptState(state, stateKey()));
 }
 
 function log(msg) {
