@@ -5,10 +5,44 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const DIR = __dirname;
 const ENV_PATH = path.join(DIR, '.env');
 const STATE_PATH = path.join(DIR, 'state.json');
+
+// State is committed to a public repo, so it is stored encrypted (AES-256-GCM).
+// The key lives in the STATE_SECRET repo secret; without it the file is unreadable.
+function stateKey() {
+  const hex = process.env.STATE_SECRET || readEnvValue('STATE_SECRET');
+  return hex ? Buffer.from(hex, 'hex') : null;
+}
+
+function readEnvValue(name) {
+  if (!fs.existsSync(ENV_PATH)) return null;
+  for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
+    const m = line.match(/^([A-Z_]+)=(.*)$/);
+    if (m && m[1] === name) return m[2].trim();
+  }
+  return null;
+}
+
+function encryptState(obj, key) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const data = Buffer.concat([cipher.update(JSON.stringify(obj), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return JSON.stringify({ __enc: 'aes-256-gcm', iv: iv.toString('hex'), tag: tag.toString('hex'), data: data.toString('base64') });
+}
+
+function decryptState(raw, key) {
+  const wrap = JSON.parse(raw);
+  if (!wrap.__enc) return wrap; // plaintext (pre-encryption migration)
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(wrap.iv, 'hex'));
+  decipher.setAuthTag(Buffer.from(wrap.tag, 'hex'));
+  const out = Buffer.concat([decipher.update(Buffer.from(wrap.data, 'base64')), decipher.final()]);
+  return JSON.parse(out.toString('utf8'));
+}
 
 const LOW_STOCK_THRESHOLD = 3;
 const UNANSWERED_REVIEW_HOURS = 24;
@@ -46,11 +80,16 @@ function loadState() {
     firstRun: true,
   };
   if (!fs.existsSync(STATE_PATH)) return defaults;
-  return { ...defaults, ...JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')) };
+  const raw = fs.readFileSync(STATE_PATH, 'utf8').trim();
+  if (!raw) return defaults;
+  const key = stateKey();
+  const parsed = key ? decryptState(raw, key) : JSON.parse(raw);
+  return { ...defaults, ...parsed };
 }
 
 function saveState(state) {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  const key = stateKey();
+  fs.writeFileSync(STATE_PATH, key ? encryptState(state, key) : JSON.stringify(state, null, 2));
 }
 
 function log(msg) {
