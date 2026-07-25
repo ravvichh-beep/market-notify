@@ -216,6 +216,10 @@ async function checkFeedback(env, state, notifications) {
 }
 
 const CHAT_NEEDS_REPLY = new Set(['NEW', 'WAITING_FOR_PARTNER']);
+// Senders whose messages should NOT trigger a notification:
+// MARKET = Yandex system notices (e.g. "не запрашивайте контакты"),
+// PARTNER = our own replies. Notify only on genuine buyer messages.
+const NON_CUSTOMER_SENDERS = new Set(['MARKET', 'PARTNER']);
 
 async function checkChats(env, state, notifications) {
   const data = await yandexPost(`/businesses/${env.YANDEX_BUSINESS_ID}/chats?limit=20`, env.YANDEX_API_KEY, {});
@@ -226,20 +230,26 @@ async function checkChats(env, state, notifications) {
     const prevStatus = state.chats[id];
     const needsReply = CHAT_NEEDS_REPLY.has(c.status);
 
-    if (needsReply && prevStatus !== c.status) {
-      if (!state.firstRun) {
-        let lastMessage = '';
-        try {
-          const history = await yandexPost(
-            `/businesses/${env.YANDEX_BUSINESS_ID}/chats/history?chatId=${c.chatId}&limit=1`,
-            env.YANDEX_API_KEY,
-            {}
-          );
-          const msgs = (history.result && history.result.messages) || [];
-          lastMessage = msgs.length ? msgs[msgs.length - 1].message : '';
-        } catch (e) {
-          log(`Chat history fetch failed for ${id}: ${e.message}`);
+    if (needsReply && prevStatus !== c.status && !state.firstRun) {
+      let lastMessage = '';
+      let lastSender = '';
+      try {
+        const history = await yandexPost(
+          `/businesses/${env.YANDEX_BUSINESS_ID}/chats/history?chatId=${c.chatId}&limit=1`,
+          env.YANDEX_API_KEY,
+          {}
+        );
+        const msgs = (history.result && history.result.messages) || [];
+        if (msgs.length) {
+          lastMessage = msgs[msgs.length - 1].message || '';
+          lastSender = msgs[msgs.length - 1].sender || '';
         }
+      } catch (e) {
+        log(`Chat history fetch failed for ${id}: ${e.message}`);
+      }
+
+      // Only ping when the newest message is actually from the buyer.
+      if (lastSender && !NON_CUSTOMER_SENDERS.has(lastSender)) {
         const shortMsg = lastMessage.length > 300 ? lastMessage.slice(0, 300) + '…' : lastMessage;
         notifications.push(
           `💬 Новое сообщение в чате (заказ #${c.orderId || '—'})\n` +
